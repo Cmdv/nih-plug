@@ -39,7 +39,7 @@
 //!     fn new(
 //!         params: Self::InitializationFlags,
 //!         context: Arc<dyn GuiContext>,
-//!     ) -> (Self, Command<Self::Message>) {
+//!     ) -> (Self, Task<Self::Message>) {
 //!         let editor = FooEditor {
 //!             params,
 //!             context,
@@ -47,7 +47,7 @@
 //!             foo_slider_state: Default::default(),
 //!         };
 //!
-//!         (editor, Command::none())
+//!         (editor, Task::none())
 //!     }
 //!
 //!     fn context(&self) -> &dyn GuiContext {
@@ -58,12 +58,12 @@
 //!         &mut self,
 //!         _window: &mut WindowQueue,
 //!         message: Self::Message,
-//!     ) -> Command<Self::Message> {
+//!     ) -> Task<Self::Message> {
 //!         match message {
 //!             Message::ParamUpdate(message) => self.handle_param_message(message),
 //!         }
 //!
-//!         Command::none()
+//!         Task::none()
 //!     }
 //!
 //!     fn view(&mut self) -> Element<'_, Self::Message> {
@@ -89,12 +89,14 @@
 //! }
 //! ```
 
-use baseview::WindowScalePolicy;
+use ::baseview::WindowScalePolicy;
 use crossbeam::atomic::AtomicCell;
 use crossbeam::channel;
+use iced_baseview::futures::Subscription;
 use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::{Editor, GuiContext};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 // This doesn't need to be re-export but otherwise the compiler complains about
 // `hidden_glob_reexports`
 pub use std::fmt::Debug;
@@ -126,6 +128,7 @@ mod wrapper;
 pub fn create_iced_editor<E: IcedEditor>(
     iced_state: Arc<IcedState>,
     initialization_flags: E::InitializationFlags,
+    fonts: Vec<Cow<'static, [u8]>>,
 ) -> Option<Box<dyn Editor>> {
     // We need some way to communicate parameter changes to the `IcedEditor` since parameter updates
     // come from outside of the editor's reactive model. This contains only capacity to store only
@@ -137,16 +140,17 @@ pub fn create_iced_editor<E: IcedEditor>(
         iced_state,
         initialization_flags,
 
-        // TODO: We can't get the size of the window when baseview does its own scaling, so if the
-        //       host does not set a scale factor on Windows or Linux we should just use a factor of
-        //       1. That may make the GUI tiny but it also prevents it from getting cut off.
-        #[cfg(target_os = "macos")]
+        // iced_baseview with iced 0.13 properly handles scale factors through WindowScalePolicy,
+        // but we still need to be careful about host-provided scaling vs system scaling.
+        // Some hosts (like Ableton Live) may provide their own scale factors that conflict
+        // with baseview's scaling. When a host provides a scale factor, we use it explicitly.
+        // Otherwise, we let iced_baseview use the system scale factor, which it now handles
+        // correctly on all platforms.
         scaling_factor: AtomicCell::new(None),
-        #[cfg(not(target_os = "macos"))]
-        scaling_factor: AtomicCell::new(Some(1.0)),
 
         parameter_updates_sender,
         parameter_updates_receiver: Arc::new(parameter_updates_receiver),
+        fonts,
     }))
 }
 
@@ -162,12 +166,14 @@ pub trait IcedEditor: 'static + Send + Sync + Sized {
     type Message: 'static + Clone + Debug + Send;
     /// See [`Application::Flags`].
     type InitializationFlags: 'static + Clone + Send + Sync;
+    /// See [`Application::Theme`]
+    type Theme: Default + DefaultStyle;
 
     /// See [`Application::new`]. This also receivs the GUI context in addition to the flags.
     fn new(
         initialization_fags: Self::InitializationFlags,
         context: Arc<dyn GuiContext>,
-    ) -> (Self, Command<Self::Message>);
+    ) -> (Self, Task<Self::Message>);
 
     /// Returns a reference to the GUI context.
     /// [`handle_param_message()`][Self::handle_param_message()] uses this to interact with the
@@ -177,11 +183,7 @@ pub trait IcedEditor: 'static + Send + Sync + Sized {
     /// See [`Application::update`]. When receiving the variant that contains a
     /// [`widgets::ParamMessage`] you can call
     /// [`handle_param_message()`][Self::handle_param_message()] to handle the parameter update.
-    fn update(
-        &mut self,
-        window: &mut WindowQueue,
-        message: Self::Message,
-    ) -> Command<Self::Message>;
+    fn update(&mut self, message: Self::Message) -> Task<Self::Message>;
 
     /// See [`Application::subscription`].
     fn subscription(
@@ -192,11 +194,19 @@ pub trait IcedEditor: 'static + Send + Sync + Sized {
     }
 
     /// See [`Application::view`].
-    fn view(&mut self) -> Element<'_, Self::Message>;
+    fn view(&self) -> Element<'_, Self::Message, Self::Theme, Renderer>;
 
     /// See [`Application::background_color`].
     fn background_color(&self) -> Color {
         Color::WHITE
+    }
+
+    fn theme(&self) -> Self::Theme {
+        Self::Theme::default()
+    }
+
+    fn title(&self) -> String {
+        "nih_plug plugin".to_owned()
     }
 
     /// See [`Application::scale_policy`].
@@ -204,20 +214,6 @@ pub trait IcedEditor: 'static + Send + Sync + Sized {
     /// TODO: Is this needed? Editors shouldn't change the scale policy.
     fn scale_policy(&self) -> WindowScalePolicy {
         WindowScalePolicy::SystemScaleFactor
-    }
-
-    /// See [`Application::renderer_settings`].
-    fn renderer_settings() -> iced_baseview::backend::settings::Settings {
-        iced_baseview::backend::settings::Settings {
-            // Enable some anti-aliasing by default. Since GUIs are likely very simple and most of
-            // the work will be on the CPU anyways this should not affect performance much.
-            antialiasing: Some(iced_baseview::backend::settings::Antialiasing::MSAAx4),
-            // Use Noto Sans as the default font as that renders a bit more cleanly than the default
-            // Lato font. This crate also contains other weights and versions of this font you can
-            // use for individual widgets.
-            default_font: Some(crate::assets::fonts::NOTO_SANS_REGULAR),
-            ..iced_baseview::backend::settings::Settings::default()
-        }
     }
 
     /// Handle a parameter update using the GUI context.

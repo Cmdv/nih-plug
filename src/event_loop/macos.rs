@@ -113,6 +113,7 @@ where
     }
 
     fn is_main_thread(&self) -> bool {
+        #[allow(unexpected_cfgs)]
         unsafe { msg_send![class!(NSThread), isMainThread] }
     }
 }
